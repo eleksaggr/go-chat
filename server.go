@@ -193,6 +193,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		for _, room := range rooms {
 			if room.Name == vars["room"] {
 				room.Join(client)
+				room.AddMessage(fmt.Sprintf("User %s has joined the channel."))
 				log.Info(fmt.Sprintf("User %s joined channel %s", client.Nickname, room.Name))
 				exists = true
 			}
@@ -203,6 +204,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			log.Info(fmt.Sprintf("Created new channel: %s", vars["room"]))
 
 			room.Join(client)
+			room.AddMessage(fmt.Sprintf("User %s has joined the channel.", client.Nickname))
 			log.Info(fmt.Sprintf("User %s joined channel %s", client.Nickname, room.Name))
 
 			roomsMutex.Lock()
@@ -220,9 +222,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 				log.Error("Error during read from client.")
 				break
 			}
+			client.Room().AddMessage(fmt.Sprintf("%s: %s", client.Nickname, message))
 			log.Info(fmt.Sprintf("%s: %s", client.Nickname, message))
-
-			client.Room().AddMessage(message)
 		}
 	}()
 }
