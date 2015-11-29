@@ -2,14 +2,15 @@ package app
 
 type Channel struct {
 	Name    string
-	Members []User
+	Members []*User
+	Message chan string
 }
 
 func NewChannel(name string) *Channel {
-	return &Channel{Name: name}
+	return &Channel{Name: name, Message: make(chan string)}
 }
 
-func (c *Channel) Add(user User) {
+func (c *Channel) Add(user *User) {
   c.Members = append(c.Members, user)
 }
 
