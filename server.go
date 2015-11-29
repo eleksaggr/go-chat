@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
-	"github.com/zillolo/chat/app"
 	"github.com/zillolo/loggo"
 	"net/http"
 	"os"
@@ -19,161 +18,219 @@ var upgrader = websocket.Upgrader{
 	WriteBufferSize: 1024,
 }
 
-var channels []*app.Channel
+var rooms []*Room
+var roomsMutex sync.Mutex
 
-var id uint32 = 0
-
-var wg sync.WaitGroup
-
-func handler(w http.ResponseWriter, r *http.Request) {
-	log.Info("Entered handler.")
-	// Get the parameters from the url
-	vars := mux.Vars(r)
-
-	// Try to connect to the clients websocket.
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Warning("Couldn't establish connection to WebSocket.")
-		return
-	}
-
-	user := app.NewUser(id, conn)
-	id = id + 1
-
-	// Read the username from the client.
-	username, err := user.Read()
-	if err != nil {
-		log.Error("Couldn't read username from client.")
-		return
-	}
-	user.Nickname = username
-
-	// Add the user to his selected channel.
-	addToChannel(user, vars["channel"])
-
-	channel, err := getChannel(vars["channel"])
-	if err != nil {
-		log.Error("A non-existent channel was called.")
-		return
-	}
-
-	wg.Add(1)
-	go handleUser(user)
-
-	wg.Wait()
-	channel.Remove(user.Id)
-	log.Info("User was removed from channel.")
-
-	user.Close()
+type Room struct {
+	Name        string
+	clients     map[string]Client
+	clientMutex sync.Mutex
+	queue       chan string
 }
 
-func handleUser(user *app.User) {
-	defer wg.Done()
-	if user == nil {
-		return
+// NewRoom creates a new room with the name name and initializes it.
+func NewRoom(name string) *Room {
+	room := new(Room)
+	room.Name = name
+	room.clients = make(map[string]Client)
+	room.queue = make(chan string)
+
+	go room.Broadcast()
+
+	return room
+}
+
+// Join makes the client join the room.
+// Should the client-pointer be nil, an error will be returned.
+func (room *Room) Join(client *Client) error {
+	if client == nil {
+		return errors.New("nil-client cannot join a room.")
 	}
 
-	channel, err := getChannelForUser(user)
-	if err != nil {
-		log.Error("User not in channel anymore.")
-		return
-	}
-	for {
-		msg, err := user.Read()
-		if err != nil {
-			log.Error(fmt.Sprintf("An error happend during read for user: %s", user.Nickname))
-			return
+	// Lock the client map for the room.
+	room.clientMutex.Lock()
+
+	if _, exists := room.clients[client.Nickname]; !exists {
+		room.clients[client.Nickname] = *client
+		if err := client.SetRoom(room); err != nil {
+			return err
 		}
-
-		log.Info(fmt.Sprintf("%s: %s", user.Nickname, msg))
-		channel.Message <- msg
 	}
+
+	room.clientMutex.Unlock()
+	return nil
 }
 
-func broadcast() {
+// Leave makes the client leave the room.
+// Should the client-pointer be nil, an error will be returned.
+func (room *Room) Leave(client *Client) error {
+	if client != nil {
+		return errors.New("Nil-client cannot leave the room.")
+	}
+
+	room.clientMutex.Lock()
+	delete(room.clients, client.Nickname)
+	room.clientMutex.Unlock()
+	return nil
+}
+
+// AddMessage adds a message to the message queue of the room.
+func (room *Room) AddMessage(message string) {
+	room.queue <- message
+}
+
+func (room *Room) Broadcast() {
 	for {
-		for _, channel := range channels {
-			select {
-			case msg, ok := <-channel.Message:
-				if ok {
-					log.Info(fmt.Sprintf("Writing a message to channel %s", channel.Name))
-					for _, user := range channel.Members {
-						err := user.Write(msg)
-						if err != nil {
-							log.Error(fmt.Sprintf("An error happend during write for user: %s", user.Nickname))
-						}
-					}
+		message := <-room.queue
+		for _, client := range room.clients {
+			if err := client.Write(message); err != nil {
+				if err = client.Exit(); err != nil {
+					log.Error("Client exited during write.")
+					break
 				}
 			}
 		}
 	}
 }
 
-// listUsers prints all users in the channel to stdout.
-func listUsers(channel *app.Channel) {
-	fmt.Println("Current users in channel:")
-	for _, user := range channel.Members {
-		fmt.Printf("%d. %s\n", user.Id, user.Nickname)
-	}
+type Client struct {
+	Nickname string
+	conn     *websocket.Conn
+	room     *Room
 }
 
-// getChannel gets a channel by name from the channel list.
-// If it does not exist it returns an error, else the channel.
-func getChannel(channelName string) (*app.Channel, error) {
-	for _, channel := range channels {
-		if channel.Name == channelName {
-			return channel, nil
-		}
+// NewClient creates a new client with the nickname name and the socket conn.
+// Should the connection-pointer be nil an error will be returned.
+func NewClient(name string, conn *websocket.Conn) (*Client, error) {
+	if conn == nil {
+		return nil, errors.New("Cannot create a client with a nil-socket.")
 	}
-	return nil, errors.New("The channel was not found.")
+
+	return &Client{Nickname: name, conn: conn}, nil
 }
 
-func getChannelForUser(user *app.User) (*app.Channel, error) {
-	for _, channel := range channels {
-		for _, u := range channel.Members {
-			if user == u {
-				return channel, nil
-			}
-		}
-	}
-	return nil, errors.New("No channel found for the user.")
-}
-
-// addToChannel adds user to the channel with the name channelName, if it exists.
-// If it does not, the channel will be created and the user added.
-// If the user is nil, the function will return an error.
-func addToChannel(user *app.User, channelName string) error {
-	if user == nil {
-		log.Error("Tried to add a nil-user to a channel.")
-		return errors.New("User was nil.")
-	}
-
-	// Check if the channel already exists, and if so add the user.
-	channel, err := getChannel(channelName)
+// Read reads a message from the client.
+// Should there be an error during the read, it will be returned.
+func (client *Client) Read() (string, error) {
+	messageType, message, err := client.conn.ReadMessage()
 	if err != nil {
-		// If we couldn't find the channel, create it and add the user.
-		channel := app.NewChannel(channelName)
-		channel.Add(user)
+		return "", err
+	}
 
-		log.Info(fmt.Sprintf("Adding new channel: %s", channelName))
-		log.Info(fmt.Sprintf("Adding user %s to channel %s", user.Nickname, channel.Name))
-		channels = append(channels, channel)
-	} else {
-		log.Info(fmt.Sprintf("Adding user %s to channel %s", user.Nickname, channel.Name))
-		channel.Add(user)
+	if messageType != websocket.TextMessage {
+		return "", errors.New("Received a non-text message.")
+	}
+
+	return string(message), nil
+}
+
+// Write writes a message to the client.
+// Should there be an error during write, it will be returned.
+func (client *Client) Write(message string) error {
+	err := client.conn.WriteMessage(websocket.TextMessage, []byte(message))
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
-func main() {
-	log.Info("Server started on port 8080.")
+// Exit removes a client from his room and closes the websocket.
+func (client *Client) Exit() error {
+	err := client.room.Leave(client)
+	if err != nil {
+		return err
+	}
+	client.conn.Close()
+	return nil
+}
 
-	go broadcast()
-	log.Info("Broadcast started.")
+// SetRoom sets the room a client belongs to. It will NOT make the client join
+// a room.
+// Should the room be a nil-pointer, an error will be returned.
+func (client *Client) SetRoom(room *Room) error {
+	if room == nil {
+		return errors.New("Client cannot join nil-room.")
+	}
+
+	client.room = room
+	return nil
+}
+
+// Room is the room the client is currently in.
+func (client *Client) Room() *Room {
+	return client.room
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+	log.Info("New client has connected.")
+	vars := mux.Vars(r)
+
+	// Wait until we get a websocket connection.
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Warning("Couldn't connect to WebSocket.")
+		return
+	}
+
+	go func() {
+		// Read the nickname from the client.
+		_, name, err := conn.ReadMessage()
+		if err != nil {
+			log.Error("Couldn't read nickname from client.")
+			return
+		}
+
+		// Create a new client.
+		client, err := NewClient(string(name), conn)
+		if err != nil {
+			log.Error("Couldn't create a new client.")
+			return
+		}
+
+		// Check if the room the client is joining already exists
+		// if so, join it, else create it and then join it.
+		exists := false
+		for _, room := range rooms {
+			if room.Name == vars["room"] {
+				room.Join(client)
+				log.Info(fmt.Sprintf("User %s joined channel %s", client.Nickname, room.Name))
+				exists = true
+			}
+		}
+
+		if !exists {
+			room := NewRoom(vars["room"])
+			log.Info(fmt.Sprintf("Created new channel: %s", vars["room"]))
+
+			room.Join(client)
+			log.Info(fmt.Sprintf("User %s joined channel %s", client.Nickname, room.Name))
+
+			roomsMutex.Lock()
+			rooms = append(rooms, room)
+			roomsMutex.Unlock()
+		}
+
+		for {
+			message, err := client.Read()
+			if err != nil {
+				err = client.Exit()
+				if err != nil {
+					log.Error("Error during exit from client.")
+				}
+				log.Error("Error during read from client.")
+				break
+			}
+			log.Info(fmt.Sprintf("%s: %s", client.Nickname, message))
+
+			client.Room().AddMessage(message)
+		}
+	}()
+}
+
+func main() {
+	log.Info("Server started on port :8080")
 
 	router := mux.NewRouter()
-	log.Info("t")
-	router.HandleFunc("/{channel}", handler)
-	log.Info("suchhia")
+	router.HandleFunc("/{room}", handler)
 	http.ListenAndServe(":8080", router)
 }
