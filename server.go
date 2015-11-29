@@ -11,7 +11,7 @@ import (
 	"sync"
 )
 
-var log = loggo.NewLog(os.Stderr)
+var log = loggo.NewLog(os.Stdout)
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -81,12 +81,14 @@ func (room *Room) AddMessage(message string) {
 
 func (room *Room) Broadcast() {
 	for {
+		//TODO: If we have no more users in the channel, exit.1
+
 		message := <-room.queue
 		for _, client := range room.clients {
 			if err := client.Write(message); err != nil {
 				if err = client.Exit(); err != nil {
-					log.Error("Client exited during write.")
-					break
+					room.AddMessage(fmt.Sprintf("User %s has left the room.", client.Nickname))
+					log.Info("Client has disconnected.")
 				}
 			}
 		}
@@ -193,7 +195,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		for _, room := range rooms {
 			if room.Name == vars["room"] {
 				room.Join(client)
-				room.AddMessage(fmt.Sprintf("User %s has joined the channel."))
+				room.AddMessage(fmt.Sprintf("User %s has joined the channel.", client.Nickname))
 				log.Info(fmt.Sprintf("User %s joined channel %s", client.Nickname, room.Name))
 				exists = true
 			}
@@ -217,9 +219,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				err = client.Exit()
 				if err != nil {
-					log.Error("Error during exit from client.")
+					client.Room().AddMessage(fmt.Sprintf("User %s has left the room.", client.Nickname))
 				}
-				log.Error("Error during read from client.")
+				log.Info("Client has disconnected.")
 				break
 			}
 			client.Room().AddMessage(fmt.Sprintf("%s: %s", client.Nickname, message))
